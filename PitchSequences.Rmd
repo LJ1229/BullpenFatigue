@@ -1,0 +1,138 @@
+---
+title: "Pitch Sequence"
+author: "Logan Johnson"
+date: "2026-06-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+library(tidyverse)
+library(ggraph)
+library(arrow)
+library(aws.s3)
+library(kableExtra)
+library(scales)
+library(zip)
+```
+
+```{r, echo=FALSE, include=FALSE, warning=FALSE}
+# Sys.setenv("AWS_ACCESS_KEY_ID" = "",
+#            "AWS_SECRET_ACCESS_KEY" = "")
+# 
+# pitch_data <- s3read_using(
+#   FUN = read_parquet,
+#   bucket = "",
+#   object = "t",
+#   opts = list(region = "us-east-1")
+# )
+# 
+# #filter regular season
+# pitcher_data <- pitch_data %>%
+#   filter(regularszn == 1) %>%
+#   filter(PitcherTeam == "NOR_TAR")
+
+pitcher_data <- read_parquet("") #insert your file
+pitcher_data <- pitcher_data %>%
+  mutate(regularszn = if_else(Date >= as.Date("2026-02-13"), 1, 0)) #change date
+
+write_parquet(pitcher_data, "") #insert file
+zip::zip("", "") #zips
+```
+
+```{r, echo=FALSE, warning=FALSE, results ='asis'}
+pitcher_data <- pitcher_data %>%
+  filter(regularszn == 1) %>%
+  filter(PitcherTeam == "") %>%
+  arrange(Date, Inning) %>%
+  group_by(Date, Inning) %>%
+  mutate(PAofInning = consecutive_id(Batter)) %>% 
+  ungroup() %>%
+  mutate(PA_ID = paste(Date, Inning, PAofInning))
+
+pa_outcomes <- pitcher_data %>%
+  group_by(PA_ID) %>%
+  slice_tail(n = 1) %>%
+  mutate(
+    is_AB = ifelse(PlayResult %in% c("Single", "Double", "Triple", "HomeRun", "FieldersChoice", "Error", "Out") | KorBB == "Strikeout", 1, 0),
+    is_Hit = ifelse(PlayResult %in% c("Single", "Double", "Triple", "HomeRun"), 1, 0),
+    TotalBases = case_when(
+      PlayResult == "Single" ~ 1,
+      PlayResult == "Double" ~ 2,
+      PlayResult == "Triple" ~ 3,
+      PlayResult == "HomeRun" ~ 4,
+      TRUE ~ 0
+    ),
+    is_OBP_event = ifelse(is_Hit == 1 | KorBB %in% c("Walk", "HitByPitch"), 1, 0),
+    is_K = ifelse(KorBB == "Strikeout", 1, 0)
+  ) %>%
+  select(PA_ID, is_AB, is_Hit, TotalBases, is_OBP_event, is_K) %>%
+  ungroup()
+
+sequence_data <- pitcher_data %>%
+  filter(PitchofPA <= 3) %>%
+  arrange(Pitcher, PA_ID, PitchofPA) %>%
+  group_by(Pitcher, PA_ID) %>%
+  summarise(
+    Pitch_Sequence = paste(TaggedPitchType, collapse = " -> "),
+    .groups = "drop") %>%
+  ungroup()
+  
+top_sequences <- sequence_data %>%
+  left_join(pa_outcomes, by = "PA_ID") %>%
+  group_by(Pitcher, Pitch_Sequence) %>%
+  summarise(
+    Sequence_Count = n(),
+    Hits = sum(is_Hit, na.rm = TRUE),
+    ABs = sum(is_AB, na.rm = TRUE),
+    PAs = n(), 
+    TBs = sum(TotalBases, na.rm = TRUE),
+    OnBase = sum(is_OBP_event, na.rm = TRUE),
+    Ks = sum(is_K, na.rm = TRUE),
+    .groups = "drop_last"
+  ) %>%
+  mutate(
+    Percent = Sequence_Count / sum(Sequence_Count),
+    BA = ifelse(ABs > 0, Hits / ABs, 0),
+    OBP = ifelse(PAs > 0, OnBase / PAs, 0),
+    SLG = ifelse(ABs > 0, TBs / ABs, 0),
+    `K%` = ifelse(PAs > 0, Ks / PAs, 0)
+  ) %>%
+  arrange(desc(Sequence_Count), .by_group = TRUE) %>%
+  slice_head(n = 5) %>% 
+  ungroup() %>%
+  mutate(
+    Percent = percent(Percent, accuracy = 0.1),
+    `K%` = percent(`K%`, accuracy = 0.1),
+    BA = sub("^(-?)0.", "\\1.", sprintf("%.3f", BA)),
+    OBP = sub("^(-?)0.", "\\1.", sprintf("%.3f", OBP)),
+    SLG = sub("^(-?)0.", "\\1.", sprintf("%.3f", SLG))
+  )
+
+pitchers <- pitcher_data %>%
+  count(Pitcher, name = "Total_Pitches") %>%
+  slice_max(Total_Pitches, n = 9) %>%
+  pull(Pitcher)
+
+for (p in pitchers){
+  individual_data <- top_sequences %>%
+    filter(Pitcher == p) %>%
+    ungroup %>%
+    mutate(
+      Sequence_Count = as.character(Sequence_Count),
+      Percent = as.character(Percent)
+    ) %>%
+    select(Pitch_Sequence, Sequence_Count, Percent, BA, OBP, SLG, `K%`)
+  
+  if (nrow(individual_data) > 0) {
+    tbl <- kable(individual_data, format = "latex", booktabs = TRUE, 
+                 col.names = c("Pitch Sequence", "Count", "Percent", "BA", "OBP", "SLG", "K%"),
+                 caption = paste0("Top 5 Most Common Pitch Sequences: ",p)) %>%
+      kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9) %>%
+      row_spec(0, bold = TRUE, background = "#F0F0F0") %>%
+      column_spec(1, bold = TRUE)
+    
+    print(tbl)
+    cat("\n\n")
+  }
+}
+```
