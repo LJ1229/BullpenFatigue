@@ -1,0 +1,202 @@
+---
+title: "Bullpen Fatigue"
+author: "Logan Johnson"
+date: "2026-09-03"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+```
+
+```{r install-baseballr, eval=FALSE}
+# install.packages("baseballr")
+```
+
+```{r load-baseballr, echo=FALSE}
+library(baseballr)
+```
+
+
+```{r pitchers, echo=FALSE}
+bullpen_pitchers <- c("Jansen, Kenley", "Kimbrel, Craig")
+
+start_date <- "2024-03-26"
+end_date   <- "2024-10-04"
+```
+
+
+```{r lookup-ids, echo=FALSE}
+pitcher_lookup <- tibble(full_name = bullpen_pitchers) %>%
+  separate(full_name, into = c("last_name", "first_name"), sep = ",\\s*")
+
+pitcher_ids <- pmap_dfr(pitcher_lookup, function(last_name, first_name) {
+  playerid_lookup(last_name = last_name, first_name = first_name) %>%
+    filter(!is.na(fangraphs_id)) %>%
+    slice(1) %>%
+    mutate(Pitcher = paste0(last_name, ", ", first_name)) %>%
+    select(Pitcher, fangraphs_id)
+})
+
+if (nrow(pitcher_ids) < length(bullpen_pitchers)) {
+  warning("Could not find a FanGraphs ID for one or more pitchers - check spelling/format.")
+}
+
+pitcher_ids
+```
+
+
+```{r pull-fangraphs, echo=FALSE}
+years <- seq(
+  as.integer(format(as.Date(start_date), "%Y")),
+  as.integer(format(as.Date(end_date), "%Y"))
+)
+
+pitcher_year <- tidyr::crossing(pitcher_ids, season = years)
+
+fg_raw <- pmap_dfr(pitcher_year, function(Pitcher, fangraphs_id, season) {
+  fg_pitcher_game_logs(playerid = fangraphs_id, year = season) %>%
+    mutate(Pitcher = Pitcher)
+})
+```
+
+
+```{r map-columns, echo=FALSE}
+ip_to_outs <- function(ip) {
+  whole  <- floor(ip)
+  thirds <- round((ip - whole) * 10)  # .1 -> 1 out, .2 -> 2 outs
+  whole * 3 + thirds
+}
+
+pitcher_game <- fg_raw %>%
+  transmute(
+    Date    = as.Date(Date),
+    Pitcher = Pitcher,
+    Outs    = ip_to_outs(as.numeric(IP)),
+    ER      = as.numeric(ER)
+  ) %>%
+  filter(Date >= as.Date(start_date), Date <= as.Date(end_date)) %>%
+  filter(Pitcher %in% bullpen_pitchers) %>%
+  arrange(Pitcher, Date)
+```
+
+
+```{r rest-days, echo=FALSE}
+pitcher_game <- pitcher_game %>%
+  group_by(Pitcher) %>%
+  mutate(
+    Prev_Date       = lag(Date),
+    Days_Since_Last = as.numeric(Date - Prev_Date),
+    Rest_Days       = Days_Since_Last - 1,
+    Rest_Category = case_when(
+      is.na(Rest_Days)  ~ "First Outing (Unknown Rest)",
+      Rest_Days <= 0    ~ "No Days Rest",   # covers same-day (doubleheader) outings too
+      Rest_Days == 1    ~ "One Day Rest",
+      Rest_Days >= 2    ~ "Multiple Days Rest",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup()
+
+rest_order <- c("No Days Rest", "One Day Rest", "Multiple Days Rest")
+```
+
+
+```{r helpers, echo=FALSE}
+calc_era <- function(er, outs) {
+  ifelse(outs == 0, NA_real_, round(27 * er / outs, 2))
+}
+
+# Traditional baseball IP notation, e.g. 6 outs remainder 1 -> "6.1"
+format_ip <- function(outs) {
+  paste0(outs %/% 3, ".", outs %% 3)
+}
+```
+
+
+```{r era-by-rest, echo=FALSE}
+era_by_pitcher_rest <- pitcher_game %>%
+  filter(Rest_Category != "First Outing (Unknown Rest)") %>%
+  group_by(Pitcher, Rest_Category) %>%
+  summarise(
+    Outs = sum(Outs),
+    ER   = sum(ER),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    IP  = format_ip(Outs),
+    ERA = calc_era(ER, Outs)
+  ) %>%
+  select(Pitcher, Rest_Category, IP, ER, ERA)
+```
+
+
+```{r pitcher-tables, results='asis', echo=FALSE}
+for (p in bullpen_pitchers) {
+
+  cat("### ", p, "\n\n")
+
+  tbl <- era_by_pitcher_rest %>%
+    filter(Pitcher == p) %>%
+    mutate(Rest_Category = factor(Rest_Category, levels = rest_order)) %>%
+    arrange(Rest_Category) %>%
+    select(Rest_Category, IP, ER, ERA) %>%
+    mutate(Rest_Category = as.character(Rest_Category))
+
+  overall <- pitcher_game %>%
+    filter(Pitcher == p) %>%
+    summarise(Outs = sum(Outs), ER = sum(ER)) %>%
+    transmute(
+      Rest_Category = "Overall",
+      IP  = format_ip(Outs),
+      ER  = ER,
+      ERA = calc_era(ER, Outs)
+    )
+
+  tbl <- bind_rows(tbl, overall)
+
+  if (nrow(tbl) == 0) {
+    cat("No data found for this pitcher.\n\n")
+  } else {
+    print(kable(tbl, col.names = c("Rest Situation", "IP", "ER", "ERA")))
+    cat("\n\n")
+  }
+}
+```
+
+
+```{r overall-by-rest, echo=FALSE}
+overall_by_rest <- pitcher_game %>%
+  filter(Rest_Category != "First Outing (Unknown Rest)") %>%
+  group_by(Rest_Category) %>%
+  summarise(Outs = sum(Outs), ER = sum(ER), .groups = "drop") %>%
+  mutate(Rest_Category = factor(Rest_Category, levels = rest_order)) %>%
+  arrange(Rest_Category) %>%
+  mutate(
+    IP  = format_ip(Outs),
+    ERA = calc_era(ER, Outs)
+  ) %>%
+  select(Rest_Category, IP, ER, ERA)
+
+kable(overall_by_rest,
+      col.names = c("Rest Situation", "IP", "ER", "ERA"),
+      caption = "Bullpen ERA by Rest Situation (All Pitchers Combined)")
+```
+
+
+```{r overall-era, echo=FALSE}
+overall_bullpen <- pitcher_game %>%
+  summarise(Outs = sum(Outs), ER = sum(ER)) %>%
+  mutate(
+    IP  = format_ip(Outs),
+    ERA = calc_era(ER, Outs)
+  )
+
+kable(overall_bullpen %>% select(IP, ER, ERA),
+      caption = "Overall Bullpen ERA")
+```
